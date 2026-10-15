@@ -58,8 +58,9 @@ def to_tensor(a, device: str) -> torch.Tensor:
 
 def make_optimizer(model: torch.nn.Module, cfg: dict) -> torch.optim.Optimizer:
     """TASK 3. The optimiser, using cfg['train']['lr'] and cfg['train']['weight_decay']."""
-    raise NotImplementedError("TASK 3: choose the optimiser")
-
+    opt = torch.optim.Adam(lr=cfg['train']['lr'], weight_decay=cfg['train']['weight_decay'])
+    
+    return opt
 
 def train_epoch(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss_fn: torch.nn.Module,
                 X: torch.Tensor, y: torch.Tensor, batch_size: int, generator: torch.Generator) -> float:

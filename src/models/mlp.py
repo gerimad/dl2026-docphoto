@@ -20,12 +20,25 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import math
 
 
 class MLP(nn.Module):
     def __init__(self, in_dim: int, hidden: list[int], dropout: float = 0.3, prior: float = 0.5):
         super().__init__()
-        raise NotImplementedError("TASK 2: build the layers")
+
+        layers = []
+        width = in_dim
+        for n in hidden:
+            layers += [nn.Linear(width, n), nn.ReLU(), nn.Dropout(p=dropout)]
+            width = n
+            
+        self.body = nn.Sequential(*layers)
+        self.head = nn.Linear(width, 1)
+        p = min(max(prior, 1e-4), 1 - 1e-4)
+
+        nn.init.zeros_(self.head.weight)
+        nn.init.constant_(self.head.bias, math.log(p / (1 - p)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("TASK 2: one number in [0, 1] per row, shape (batch,)")
+        return torch.sigmoid(self.head(self.body(x))).squeeze(-1)
