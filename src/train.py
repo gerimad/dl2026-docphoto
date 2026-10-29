@@ -58,9 +58,7 @@ def to_tensor(a, device: str) -> torch.Tensor:
 
 def make_optimizer(model: torch.nn.Module, cfg: dict) -> torch.optim.Optimizer:
     """TASK 3. The optimiser, using cfg['train']['lr'] and cfg['train']['weight_decay']."""
-    opt = torch.optim.Adam(lr=cfg['train']['lr'], weight_decay=cfg['train']['weight_decay'])
-    
-    return opt
+    return torch.optim.AdamW(params=model.parameters(), lr=cfg['train']['lr'], weight_decay=cfg['train']['weight_decay'])
 
 def train_epoch(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss_fn: torch.nn.Module,
                 X: torch.Tensor, y: torch.Tensor, batch_size: int, generator: torch.Generator) -> float:
@@ -70,7 +68,24 @@ def train_epoch(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss_f
     run is reproducible, step the optimiser once per minibatch, and return the
     mean training loss over the epoch, weighted by minibatch size.
     """
-    raise NotImplementedError("TASK 4: the minibatch loop")
+
+    model.train()
+    perm = torch.randperm(len(X), generator=generator)
+
+    total_loss = 0.0
+    for start in range(0, len(X), batch_size):
+        idx = perm[start:start+batch_size]
+
+        xb, yb = X[idx], y[idx]
+        optimizer.zero_grad()
+        loss = loss_fn(model(xb), yb)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * len(idx)
+
+    return total_loss / len(X)
+
 
 
 def predict(model: torch.nn.Module, X: torch.Tensor, batch_size: int = 1024) -> np.ndarray:
@@ -79,13 +94,24 @@ def predict(model: torch.nn.Module, X: torch.Tensor, batch_size: int = 1024) -> 
     Evaluation mode, no gradients, and it must give the same answer for a row
     whether that row is predicted alone or inside a batch.
     """
-    raise NotImplementedError("TASK 5: inference")
 
+    model.eval()
+    outputs = []
+    with torch.no_grad():
+        for start in range(0, len(X), batch_size):
+            xb = X[start:start + batch_size]
+            preds = model(xb).cpu().numpy()
+            outputs.append(preds)
+            
+    return np.concatenate(outputs).reshape(-1)
 
 def validate(model: torch.nn.Module, X_val: torch.Tensor, y_val: np.ndarray, ok: np.ndarray) -> float:
     """TASK 6. RMSE on the validation rows where `ok` is True (the scoreable ones)."""
-    raise NotImplementedError("TASK 6: validation")
 
+    preds = predict(model, X_val, 1024)
+    err = preds[ok] - y_val[ok]
+    
+    return float(np.sqrt(np.mean(err ** 2)))
 
 # ------------------------------------------------------------------ given
 
@@ -101,12 +127,31 @@ def train_mlp(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray,
     set_seed(cfg["seed"])
     tr = cfg["train"]
 
-    scaler = Standardiser().fit(X[train_idx])
-    X_tr = to_tensor(scaler.transform(X[train_idx]), device)
+    es = cfg.get("early_stopping")
+    fit_idx = train_idx
+    if es:
+        sub = df.iloc[train_idx]
+        inner_fit, inner_es = build_splits(sub, group_column=es["group_column"], val_fraction=es["fraction"], seed=es["seed"])
+        fit_idx = train_idx[inner_fit]
+        es_idx = train_idx[inner_es]
+        # print(len(fit_idx), len(es_idx))
+
+    
+    # print(len(fit_idx))
+
+    scaler = Standardiser().fit(X[fit_idx])
+    X_tr = to_tensor(scaler.transform(X[fit_idx]), device)
     X_va = to_tensor(scaler.transform(X[val_idx]), device)
-    y_tr = to_tensor(df[config.TARGET].to_numpy()[train_idx], device)
+    y_tr = to_tensor(df[config.TARGET].to_numpy()[fit_idx], device)
     y_va = df[config.TARGET].to_numpy()[val_idx]
     ok = df["eval_ok"].to_numpy()[val_idx] == 1
+
+    if es:
+        X_es = to_tensor(scaler.transform(X[es_idx]), device)
+        y_es = df[config.TARGET].to_numpy()[es_idx]
+        ok_es = df["eval_ok"].to_numpy()[es_idx] == 1
+
+    # print(X_tr.shape, X_es.shape, ok_es.sum())
 
     model = MLP(in_dim=X.shape[1], hidden=list(cfg["model"]["hidden"]), dropout=cfg["model"]["dropout"],
                 prior=float(y_tr.mean())).to(device)
@@ -118,15 +163,29 @@ def train_mlp(cfg: dict, X: np.ndarray, df: pd.DataFrame, train_idx: np.ndarray,
     history, snapshots = [], {}
     log(f"{cfg['name']}: {len(train_idx)} train / {len(val_idx)} val rows, {X.shape[1]} inputs, "
         f"{sum(p.numel() for p in model.parameters()):,} parameters, {device}")
+
+    best_es = float('inf')
+    best_epoch = 0
+    best_state = None
+
     for epoch in range(1, tr["epochs"] + 1):
         t0 = time.time()
         loss = train_epoch(model, optimizer, loss_fn, X_tr, y_tr, tr["batch_size"], generator)
+
+        es_rmse = float('inf')
+        if es:
+            es_rmse = validate(model, X_es, y_es, ok_es)
+            if es_rmse < best_es:
+                best_es = es_rmse
+                best_epoch = epoch
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        
         val = validate(model, X_va, y_va, ok)
         train_eval = rmse(y_tr.cpu().numpy(), predict(model, X_tr))   # dropout off, as in validation
-        row = {"epoch": epoch, "train_loss": loss, "train_rmse": train_eval, "val_rmse": val,
+        row = {"epoch": epoch, "train_loss": loss, "train_rmse": train_eval, "es_rmse": es_rmse , "val_rmse": val,
                "seconds": time.time() - t0}
         history.append(row)
-        tracking.log_metrics({"train_loss": loss, "train_rmse": train_eval, "val_rmse": val}, step=epoch)
+        tracking.log_metrics({"train_loss": loss, "train_rmse": train_eval, "val_rmse": val, "es_rmse": es_rmse}, step=epoch)
         if epoch in (1, tr["epochs"]) or epoch % tr.get("log_every", 10) == 0:
             log(f"epoch {epoch:3d}  train loss {loss:.4f}  train RMSE {train_eval:.4f}  val RMSE {val:.4f}")
         if epoch in (1, tr["epochs"]):
